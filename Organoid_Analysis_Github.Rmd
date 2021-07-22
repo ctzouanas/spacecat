@@ -1,0 +1,737 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+# rm(list=ls())
+#source("http://bit.ly/archived-seurat")
+
+#install.packages("devtools")
+knitr::opts_knit$set(root.dir = "/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis")
+library(Seurat)
+library(Matrix)
+library(gplots)
+library(dplyr)
+library(tidyverse)
+library(nichenetr)
+library(magrittr)
+library(msigdbr)
+library(piano)
+library(pheatmap)
+library(progeny)
+library(lsr)
+library(dorothea)
+library(ggplot2)
+library(cowplot)
+library(fgsea)
+library(pdftools)
+library("wesanderson")
+# source("../../AncestralWisdom/Preprocess_QC_CT_v1.1.R")
+source("../../AncestralWisdom/celltypescoring_CT.R")
+source("../../AncestralWisdom/Pathway_List_Scoring_CT.R")
+source("../../AncestralWisdom/fgsea_wrappers_CT.R")
+# setwd('/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis')
+markers.path <- '2_Clustering/interesting_intestine_markers.csv'
+module.markers <- read.csv(markers.path, header = T, fill = T)
+list.files("../../AncestralWisdom")
+getwd()
+ls()
+```
+
+```{r Quick power calculation for Supplementary Note 1}
+# Specifically, what's the rarest cell fraction where we can detect at least 5 cells with P = 0.05, given that we have a sample size that's 500-1500 cells?
+n_total = 1000
+n_rare = 10
+cumulative_p_success = pbinom(q = n_rare, size = n_total, prob = 0.017)
+print(cumulative_p_success)
+
+```
+
+```{r Read in data, make a single Seurat object}
+# # Code used to go from DGE matrices to Seurat object
+# Green
+data.1 = read.delim("/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/0_UMI_DGE/CGKZ_Outputs_SPACECAT_Organoids_Run_674_C3PO_SPACECAT_Organoid_Green_SPACECAT_Organoid_Green_dge.txt")
+rownames(data.1) = data.1$GENE
+data.1$GENE=NULL
+colnames(data.1) = paste(colnames(data.1), "_Green", sep="")
+data.1[is.na(data.1)] <- 0
+
+# Rest
+data.2 = read.delim("/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/0_UMI_DGE/CGKZ_Outputs_SPACECAT_Organoids_Run_674_C3PO_SPACECAT_Organoid_Rest_SPACECAT_Organoid_Rest_dge.txt")
+rownames(data.2) = data.2$GENE
+data.2$GENE=NULL
+colnames(data.2) = paste(colnames(data.2), "_Rest", sep="")
+data.2[is.na(data.2)] <- 0
+
+# Ileal Sample 1 - these line up with green and rest samples from the day of spacecat itself. 
+data.3 = read.delim("/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/0_UMI_DGE/S3_org_1_dge.txt")
+rownames(data.3) = data.3$GENE
+data.3$GENE=NULL
+colnames(data.3) = paste(colnames(data.3), "_Ileal1", sep="")
+data.3[is.na(data.3)] <- 0
+
+# Ileal Sample 2 - these line up with green and rest samples from the day of spacecat itself
+data.4 = read.delim("/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/0_UMI_DGE/S3_org_2_dge.txt")
+rownames(data.4) = data.4$GENE
+data.4$GENE=NULL
+colnames(data.4) = paste(colnames(data.4), "_Ileal2", sep="")
+data.4[is.na(data.4)] <- 0
+
+Objs = list(data.1, data.2, data.3, data.4)
+data.all = data.frame()
+for(ii in 1:length(Objs)){
+  data.all = merge(data.all, Objs[[ii]], by = "row.names", all.x = TRUE, all.y = TRUE)
+  rownames(data.all) = data.all$Row.names
+  data.all$Row.names = NULL
+}
+data.all.1 = data.all
+data.all.1[is.na(data.all.1)] <- 0
+```
+
+```{r Preliminary QC}
+################################################################################
+##### data QC 
+################################################################################
+index.colsum = colSums(data.all.1, na.rm=TRUE) #total number of umi-normalized reads per cell across all genes/cell
+index.rowsum = rowSums(data.all.1, na.rm=TRUE) # total number of umi-normalized reads per gene across cells
+
+##### cut on every gene with ANY expression
+data.all.10.cut1 = data.all.1[which(index.rowsum>0),]
+dim(data.all.1)
+dim(data.all.10.cut1)
+
+##### cut on the good cells 
+hist(index.colsum,2000, xlim=c(0,20000), col="grey")
+abline(v=300, col="red")
+data.all.10.cut2 = data.all.10.cut1[,which((index.colsum>300)&(index.colsum<15000))]
+dim(data.all.10.cut2)
+
+#### get a sense of the total genes/cell
+index.genecount = vector(mode="numeric", length=ncol(data.all.10.cut2))
+for(i in 1:length(index.genecount)){
+	temp = length(which(data.all.10.cut2[,i]>0))
+	index.genecount[i] = temp
+}
+
+
+hist(index.genecount,200, col="dodgerblue3")
+abline(v=300)
+
+data.all.10.cut3 = data.all.10.cut2[,which(index.genecount>300)]
+dim(data.all.10.cut3)
+
+#23766   570
+data.all = data.all.10.cut3
+```
+
+```{r Create Seurat object}
+###########################################################
+###########################################################
+# create seurat object for the subset, normalize, scale
+###########################################################
+###########################################################
+ParentCluster = "Organoids_V1"
+data.all.seurat = CreateSeuratObject(data.all, project=paste("Subcluster", ParentCluster, sep=""),min.cells=0,min.genes = 0 ,is.expr=0.0, normalization.method=NULL, do.scale=FALSE, do.center=FALSE, names.delim="_", names.field=2)
+data.all.seurat$percent.mt = PercentageFeatureSet(data.all.seurat, pattern = "^MT-")
+VlnPlot(data.all.seurat, features = "percent.mt")
+figdir.cluster = "1_Preprocess_CellCycleRegress"
+data.all.seurat$orig.sample = Idents(data.all.seurat)
+# Score cell cycle genes, to then regress them out
+cell.cycle = read.delim("AncestralWisdom/cell_cycle_vignette_files/nestorawa_forcellcycle_expressionMatrix.txt")
+
+s.genes = cc.genes$s.genes
+g2m.genes = cc.genes$g2m.genes
+
+data.all.seurat <- SCTransform(data.all.seurat, assay = 'RNA', new.assay.name = 'SCT', verbose = FALSE)
+
+# perform cell cycle analysis (make sure to specify the "assay" parameter
+data.all.seurat <- CellCycleScoring(data.all.seurat, s.features = s.genes, g2m.features = g2m.genes, assay = 'SCT', set.ident = TRUE)
+phase.rename <- data.all.seurat$Phase
+phase.rename[phase.rename == "G1"] = "G0/1"
+phase.rename <- factor(phase.rename, levels = c("G0/1", "S", "G2M"))
+data.all.seurat$PhaseRename = phase.rename
+
+# VlnPlot(data.all.seurat,features = "nCount_RNA")
+RidgePlot(data.all.seurat, c("S.Score"), group.by="orig.ident")
+RidgePlot(data.all.seurat, c("G2M.Score"), group.by="orig.ident")
+
+vars.for.regress = c("percent.mt", "nCount_RNA", "nFeature_RNA", "S.Score", "G2M.Score")
+# Wrapper function for choosing number of PC's, and clustering resolution based on maximizing silhouette coefficient. 
+# Chosen PC's are 1:10, and resolution = 0.332
+optimal.obj <- GenClustObj(data.all.seurat, sample_name = "Spacecat_Organoids_BenSamples", figdir = figdir.cluster, 
+                           vars.to.regress.genclust.in = vars.for.regress)
+
+DimPlot(optimal.obj, group.by = "PhaseRename")
+FeaturePlot(optimal.obj, features = "nCount_RNA")
+FeaturePlot(optimal.obj, features = "nFeature_RNA")
+FeaturePlot(optimal.obj, features = "S.Score")
+FeaturePlot(optimal.obj, features = "G2M.Score")
+FeaturePlot(optimal.obj, features = "percent.mt")
+DimPlot(optimal.obj, group.by = "orig.ident")
+```
+
+```{r Integration}
+#####
+
+# Run integration (from Seurat website vignettes)
+cells.keep <- colnames(optimal.obj)[optimal.obj$percent.mt < 60]
+optimal.obj <- optimal.obj[,cells.keep]
+organoid.list <- SplitObject(optimal.obj, split.by = "orig.sample")
+
+for (i in 1:length(organoid.list)) {
+  organoid.list[[i]] <- SCTransform(organoid.list[[i]], verbose = FALSE, vars.to.regress = vars.for.regress)
+}
+
+organoid.features <- SelectIntegrationFeatures(object.list = organoid.list, nfeatures = 3000)
+options(future.globals.maxSize = 1000 * 1024^2)
+organoid.list <- PrepSCTIntegration(object.list = organoid.list, anchor.features = organoid.features, 
+                                    verbose = FALSE)
+organoid.anchors <- FindIntegrationAnchors(object.list = organoid.list, normalization.method = "SCT", 
+                                           anchor.features = organoid.features, verbose = FALSE)
+organoid.integrated <- IntegrateData(anchorset = organoid.anchors, normalization.method = "SCT", 
+                                     verbose = FALSE)
+organoid.integrated <- RunPCA(organoid.integrated, verbose = FALSE)
+ElbowPlot(organoid.integrated)
+organoid.integrated <- RunUMAP(organoid.integrated, dims = 1:10, assay = "integrated")
+DimPlot(organoid.integrated, group.by = "orig.sample", cells.highlight=colnames(organoid.integrated)[organoid.integrated$orig.sample=="Green"])
+
+# Do GenClustObj on the integrated assay
+ElbowPlot(organoid.integrated)
+n.pcs.integrated = 1:10
+organoid.integrated@misc$nPCs = n.pcs.integrated
+organoid.integrated = ChooseClusterResolutionDownsample(input.srobj = organoid.integrated, assay = "integrated", 
+                                                        sample_name = "Spacecat_Organoids_Integrated_BenSamples", 
+                                                        res.low = 0.2, res.high = 1.2, n.pcs = organoid.integrated@misc$nPCs, res.n = 40, 
+                                                        bias = "over", figdir = figdir.cluster)
+organoid.integrated@misc$nPCs = n.pcs.integrated
+
+# DimHeatmap(organoid.integrated, dims = organoid.integrated@misc$nPCs, cells = 500, balanced = TRUE)
+
+organoid.integrated = FindNeighbors(organoid.integrated, reduction = "pca", dims = organoid.integrated@misc$nPCs, assay = "integrated")
+organoid.integrated = FindClusters(organoid.integrated, resolution = organoid.integrated@misc$resolution.choice)
+DimPlot(organoid.integrated, reduction = "umap", group.by = "integrated_snn_res.0.332")
+DimPlot(organoid.integrated, reduction = "umap", group.by = "Best.Clusters")
+DimPlot(organoid.integrated, cells.highlight = colnames(organoid.integrated)[organoid.integrated$orig.ident == "Green"])
+DimPlot(organoid.integrated, group.by = "PhaseRename")
+saveRDS(organoid.integrated, '1_Preprocess/Spacecat_IlealOrganoid_Integrated_withaddtlBenSamples.rds')
+
+# find markers for final clusters
+Idents(organoid.integrated) = "integrated_snn_res.0.332"
+organoid.integrated.all.markers <- FindAllMarkers(organoid.integrated, assay = "RNA", only.pos = FALSE, 
+                                                  logfc.threshold = 0.25, min.pct = 0.1, test.use = "wilcox")
+
+organoid.integrated.all.markers %>% group_by(cluster) %>% top_n(100, avg_logFC) -> top100
+
+write.table(data.frame(top100), file=paste(figdir.cluster, "/Spacecat_IlealOrganoid_Integrated_Markers.txt", sep=""), quote=FALSE, sep="\t")
+figdir.cluster <- "2_Clustering"
+pdf(paste0(figdir.cluster, '/Spacecat_IlealOrganoid_Integrated_Markers_Regress_pctmito_cellcycle_nFeat_nUMI.pdf'))
+DefaultAssay(organoid.integrated) = "RNA"
+for(ii in 1:ncol(module.markers)){
+  module.ii.init <- module.markers[,ii]
+  module.ii.init <- module.ii.init[module.ii.init != ""]
+  module.name.ii <- colnames(module.markers)[[ii]]
+  print(module.name.ii)
+  if(module.ii.init[ii] != toupper(module.ii.init[ii])){
+    module.ii <- nichenetr::convert_mouse_to_human_symbols(module.ii.init)
+    module.ii <- unname(module.ii[!is.na(module.ii)])
+  } else{
+    module.ii <- unname(module.ii.init)
+  }
+  print(module.ii)
+  module.markers[,ii] = ""
+  module.markers[1:length(module.ii),ii] <- module.ii
+  organoid.integrated <- AddModuleScore(organoid.integrated, features = list(module.ii), name = module.name.ii)
+  
+  p.ii <- FeaturePlot(organoid.integrated, features = paste0(module.name.ii, "1"))
+  plot(p.ii)
+  
+}
+dev.off()
+
+# heatmap 
+organoid.integrated.all.markers %>% group_by(cluster) %>% top_n(10, avg_logFC) -> top100
+#as.data.frame(top100)
+temp.genes.plot = as.data.frame(top100)$gene
+
+pdf(paste(figdir.cluster, "/Heatmap top 50 genes Final Subcluster_", ParentCluster,".pdf", sep=""),width=13, height=8, useDingbats=FALSE)
+DoHeatmap(organoid.integrated, features=temp.genes.plot, disp.min=-2, disp.max=2, slot = "data")
+dev.off()
+
+Idents(organoid.integrated) = "integrated_snn_res.0.332"
+VlnPlot(organoid.integrated, "percent.mt")
+VlnPlot(organoid.integrated, "nFeature_RNA")
+VlnPlot(organoid.integrated, "nCount_RNA")
+DimPlot(organoid.integrated)
+```
+
+```{r Name Clusters}
+# integrated_snn_res.0.332
+# Annotate cluster 4 as Transit-Amplifying - intermediate stem scores, somewhat high for TA module, lots of cycling
+# Annotate cluster 5 as Goblet - SPINK4, MUC2, ITLN1, FCGBP
+# Annotate cluster 1 as Enterocyte.1 - FABP1, KRT19, LDHA, KRT8
+# Annotate cluster 3 as Enterocyte.2 - CDHR5, KRT20, COL17A1, APOB
+# Annotate cluster 0 as Stem.1 - OLFM4, EPHB2, LRIG1, RPS4Y1, GSTM3
+# Annotate cluster 2 as Stem.2 - OLFM4, SMOC2, RGS5, AQP5, PHLDA1
+
+new.cluster.ids <- c("Stem.1", "Enterocyte.1", "Stem.2", "Enterocyte.2", "Cycling TA", "Goblet")
+Idents(organoid.integrated) <- "integrated_snn_res.0.332"
+names(new.cluster.ids) <- levels(organoid.integrated)
+organoid.integrated <- RenameIdents(organoid.integrated, new.cluster.ids)
+organoid.integrated$celltypes.CT.1 <- Idents(organoid.integrated)
+organoid.integrated$celltypes.CT.1 <- factor(organoid.integrated$celltypes.CT.1, 
+                                             levels = c("Stem.1", "Stem.2", "Cycling TA", "Enterocyte.1", "Enterocyte.2", "Goblet"))
+DimPlot(organoid.integrated, group.by = "celltypes.CT.1")
+```
+
+```{r Graphs for figures}
+##### 
+figdir.figure <- "3_Figures"
+organoid.integrated <- readRDS('2_Clustering/Spacecat_IlealOrganoid_Integrated_Filtered_withaddtlBenSamples_regress_cellcycle_pctmt_nUMI_nFeat.rds')
+celltypes.pal = c("#016064", "#009597", "#a5a0a1", "#faaa5e", "#c95f28", "#ad2524")
+cellcycle.pal = c("#638ccc", "#c57c3c", "#ca5670")
+shape.of.water.green = c("#aaaaaa", "#62bf36")
+shape.of.water.greenblack = rev(c("#aaaaaa", "#000000", "#62bf36"))
+
+Array.Cluster = paste(as.vector(organoid.integrated@meta.data$orig.ident), as.vector(organoid.integrated@meta.data$celltypes.CT.1), sep="_")
+organoid.integrated$Array.Cluster = Array.Cluster
+Idents(organoid.integrated) = "Array.Cluster"
+table(organoid.integrated$Array.Cluster)
+table(organoid.integrated$orig.ident)
+table(organoid.integrated$celltypes.CT.1)
+
+# Violin Plot of stem module scores
+pdf(paste0(figdir.figure, '/VlnPlot_StemScore_celltypesCT1.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p1 <- VlnPlot(organoid.integrated, "ben_stem1", group.by = "celltypes.CT.1", pt.size = 0, cols = celltypes.pal) + ggtitle('Stem Module Score') + 
+  theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text.y = element_blank()) + NoLegend()
+plot(p1)
+dev.off()
+# saveRDS(organoid.integrated, '1_Preprocess/Spacecat_IlealOrganoid_Integrated_Filtered_withaddtlBenSamples.rds')
+
+# UMAP by annotated clusters
+pdf(paste0(figdir.figure, '/UMAP_bycluster_celltypesCT1.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p2 <- DimPlot(organoid.integrated, group.by = "celltypes.CT.1", cols = celltypes.pal) + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(), axis.ticks=element_blank())
+plot(p2)
+dev.off()
+pdf(paste0(figdir.figure, '/UMAP_bycluster_celltypesCT1_NoLegend.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p3 <- p2 + NoLegend()
+plot(p3)
+dev.off()
+
+# UMAP by photoactivation status
+pdf(paste0(figdir.figure, '/UMAP_bypA.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p4 <- DimPlot(organoid.integrated, cells.highlight = colnames(organoid.integrated)[organoid.integrated$orig.sample == "Green"], cols.highlight = shape.of.water.green[1], cols = shape.of.water.green[2], pt.size = 1) + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(), axis.ticks=element_blank()) + scale_color_manual(labels = c("Whole Organoid", "Calcein NVOC+"), values = shape.of.water.green)
+plot(p4)
+dev.off()
+pdf(paste0(figdir.figure, '/UMAP_bypA_NoLegend.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p5 <- p4 + NoLegend()
+plot(p5)
+dev.off()
+
+# UMAP by photoactivation status, with green vs. grey vs. black cells for photoactivated vs. same-day non-photoactivated vs. reference datset
+dataset.orig <- organoid.integrated$orig.ident
+dataset.orig[dataset.orig %in% c("Ileal1", "Ileal2")] = "Reference"
+dataset.orig <- factor(dataset.orig, levels = c("Green", "Rest", "Reference"))
+organoid.integrated$dataset.orig <- dataset.orig
+DimPlot(organoid.integrated, group.by = "dataset.orig")
+pdf(paste0(figdir.figure, '/UMAP_bypA_pAvssamedayctrlvsreference.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p4 <- DimPlot(organoid.integrated, group.by = "dataset.orig", cols = shape.of.water.greenblack, pt.size = 1, order = levels(dataset.orig)) + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(), axis.ticks=element_blank(), plot.title=element_blank()) + scale_color_manual(labels = c("Calcein NVOC+", "Same-Day Control", "Reference Dataset"), values = rev(shape.of.water.greenblack))
+plot(p4)
+dev.off()
+pdf(paste0(figdir.figure, '/UMAP_bypA_pAvssamedayctrlvsreference_NoLegend.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p5 <- p4 + NoLegend()
+plot(p5)
+dev.off()
+
+# UMAP by cell cycle
+pdf(paste0(figdir.figure, '/UMAP_bycellcycle_celltypesCT1.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p6 <- DimPlot(organoid.integrated, group.by = "PhaseRename", order = c("G2M", "S", "G0/1"), pt.size = 1, cols = cellcycle.pal) + theme(axis.title.x = element_blank(), axis.title.y = element_blank(), axis.text = element_blank(), axis.ticks = element_blank())
+plot(p6)
+dev.off()
+pdf(paste0(figdir.figure, '/UMAP_bycellcycle_celltypesCT1_NoLegend.pdf'), useDingbats = FALSE, width = 7, height = 7)
+p7 <- p6 + NoLegend()
+plot(p7)
+dev.off()
+
+# Stacked barplot of cell cycle - organoids processed on day of spacecat only
+Idents(organoid.integrated) <- "orig.ident"
+organoid.integrated.green.rest.only <- organoid.integrated[,colnames(organoid.integrated)[organoid.integrated$orig.sample %in% c("Green", "Rest")]]
+organoid.integrated.green.rest.only$PhaseRename <- factor(organoid.integrated.green.rest.only$PhaseRename, levels = rev(c("G0/1", "S", "G2M")))
+pdf(paste0(figdir.figure, '/Barchart_CellCycle_celltypesCT1.pdf'), useDingbats = FALSE, width = 3.5, height = 7)
+p8 <- ggplot(organoid.integrated.green.rest.only@meta.data, aes(x = organoid.integrated.green.rest.only@active.ident, 
+       fill = PhaseRename)) + 
+  geom_bar(position = "fill", colour = "black", width = 0.5) + scale_fill_manual(values = cellcycle.pal) + 
+  guides(fill=guide_legend(title="Phase")) + theme_classic(base_size = 15) + scale_y_continuous(expand = c(0,0)) + 
+  scale_x_discrete(labels = c("Calcein NVOC+", "Whole Organoid")) + ylab("% of Cells") + 
+  theme(axis.title.x = element_blank())
+plot(p8)
+dev.off()
+
+# Stacked barplot of cell cycle - calcein NVOC+, calcein NVOC-, and reference dataset
+Idents(organoid.integrated) <- "dataset.orig"
+organoid.integrated$PhaseRename <- factor(organoid.integrated$PhaseRename, levels = rev(c("G0/1", "S", "G2M")))
+pdf(paste0(figdir.figure, '/Barchart_CellCycle_celltypesCT1_pAvsnonpAvsreference.pdf'), useDingbats = FALSE, width = 3.5, height = 7)
+p8 <- ggplot(organoid.integrated@meta.data, aes(x = organoid.integrated@active.ident, 
+       fill = PhaseRename)) + 
+  geom_bar(position = "fill", colour = "black", width = 0.5) + scale_fill_manual(values = cellcycle.pal) + 
+  guides(fill=guide_legend(title="Phase")) + theme_classic(base_size = 15) + scale_y_continuous(expand = c(0,0)) + 
+  scale_x_discrete(labels = c("Calcein NVOC+", "Calcein NVOC-", "Reference Dataset")) + ylab("% of Cells") + 
+  theme(axis.title.x = element_blank())
+plot(p8)
+dev.off()
+
+pdf(paste0(figdir.figure, '/Barchart_CellCycle_celltypesCT1_pAvsnonpAvsreference_NoLegend.pdf'), useDingbats = FALSE, width = 3.5, height = 7)
+p9 <- p8 + NoLegend()
+plot(p9)
+dev.off()
+
+gene.list.CT <- c("OLFM4", "EPHB2", "LRIG1", "RPS4Y1", "GSTM3", "SMOC2", "RGS5", "AQP5", "PHLDA1",
+                  "FABP1", "KRT19", "LDHA", "KRT8", "CDHR5", "KRT20", "COL17A1", "APOB", 
+                  "SPINK4", "MUC2", "ITLN1", "FCGBP")
+organoid.integrated$celltypes.CT.1 <- factor(organoid.integrated$celltypes.CT.1, 
+                                             levels = rev(levels(organoid.integrated$celltypes.CT.1)))
+pdf(paste0(figdir.figure, '/DotPlot_celltypesCT1.pdf'), useDingbats = FALSE, width = 9, height = 3)
+p10 <- DotPlot(organoid.integrated, assay = "RNA", features = gene.list.CT, cols = c("lightgrey", "black"), 
+        group.by = "celltypes.CT.1") + RotatedAxis() + 
+  theme(axis.text = element_text(size = 9), axis.title = element_blank()) #+ scale_x_discrete(position = "top")
+plot(p10)
+dev.off()
+pdf(paste0(figdir.figure, '/DotPlot_celltypesCT1_NoLegend.pdf'), useDingbats = FALSE, width = 9, height = 3)
+p11 <- p10 + NoLegend()
+plot(p11)
+dev.off()
+
+# Barplot of cell counts across clusters
+org.filt.green.rest.only.df <- organoid.integrated.green.rest.only@meta.data %>% 
+  select(orig.ident, celltypes.CT.1) %>% table %>% data.frame %>% 
+  pivot_wider(names_from = celltypes.CT.1, values_from = Freq) %>% 
+  column_to_rownames("orig.ident") %>% as.matrix %>% t %>% scale(center = FALSE, scale = colSums(.)) %>% t %>%
+  as.data.frame() %>% rownames_to_column(var = "pA.Condition") %>% 
+  pivot_longer(!pA.Condition, names_to = "Cluster", values_to = "Proportion")
+org.filt.green.rest.only.df$Percentage <- org.filt.green.rest.only.df$Proportion * 100
+org.filt.green.rest.only.df$Cluster <- factor(org.filt.green.rest.only.df$Cluster,
+                                              levels = levels(organoid.integrated$celltypes.CT.1))
+org.filt.green.rest.only.df$pA.Condition <- factor(org.filt.green.rest.only.df$pA.Condition, 
+                                                   levels = c("Green", "Rest"))
+pdf(paste0(figdir.figure, '/BarPlot_clustersbypA_celltypesCT1.pdf'), useDingbats = FALSE, width = 9, height = 3)
+p12 <- ggplot(org.filt.green.rest.only.df, aes(fill=pA.Condition, y=Percentage, x=Cluster)) + geom_bar(position="dodge", stat="identity", width = 0.5) +
+  coord_flip() + theme_classic() + scale_fill_manual(values=c(shape.of.water.green, "#000000")) + scale_y_continuous(expand = c(0,0)) + NoLegend() + ylab('% of Sample') + xlab('')
+plot(p12)
+dev.off()
+organoid.integrated$celltypes.CT.1 <- factor(organoid.integrated$celltypes.CT.1, 
+                                             levels = rev(levels(organoid.integrated$celltypes.CT.1)))
+
+pdf(paste0(figdir.figure, '/Combined_MarkerDotPlot_BarPolt_clustersbypA_celltypesCT1.pdf'), useDingbats = FALSE, width = 18, height = 4)
+p13 <- p11 + scale_y_discrete(position = "right") + theme(axis.text.y = element_blank())
+p14 <- plot_grid(p13, p12, align = "h", rel_widths = c(1, 1)) + theme(text = element_text(size = 40))
+plot(p14)
+dev.off()
+
+# Barplot of cell counts across clusters, split out by calcein NVOC+, calcein NVOC-, reference
+org.filt.green.rest.only.df <- organoid.integrated@meta.data %>% 
+  select(dataset.orig, celltypes.CT.1) %>% table %>% data.frame %>% 
+  pivot_wider(names_from = celltypes.CT.1, values_from = Freq) %>% 
+  column_to_rownames("dataset.orig") %>% as.matrix %>% t %>% scale(center = FALSE, scale = colSums(.)) %>% t %>%
+  as.data.frame() %>% rownames_to_column(var = "pA.Condition") %>% 
+  pivot_longer(!pA.Condition, names_to = "Cluster", values_to = "Proportion")
+org.filt.green.rest.only.df$Percentage <- org.filt.green.rest.only.df$Proportion * 100
+org.filt.green.rest.only.df$Cluster <- factor(org.filt.green.rest.only.df$Cluster,
+                                              levels = levels(organoid.integrated$celltypes.CT.1))
+org.filt.green.rest.only.df$pA.Condition <- factor(org.filt.green.rest.only.df$pA.Condition,
+                                                   levels = rev(c("Green", "Rest", "Reference")))
+pdf(paste0(figdir.figure, '/BarPlot_clustersbypA_pAvsnonpAvsreference_celltypesCT1.pdf'), useDingbats = FALSE, width = 9, height = 3)
+p12 <- ggplot(org.filt.green.rest.only.df, aes(fill=pA.Condition, y=Percentage, x=Cluster)) + geom_bar(position="dodge", stat="identity", width = 0.5) +
+  coord_flip() + theme_classic() + scale_fill_manual(values=rev(c(shape.of.water.greenblack))) + scale_y_continuous(expand = c(0,0)) + NoLegend() + ylab('% of Sample') + xlab('')
+plot(p12)
+dev.off()
+organoid.integrated$celltypes.CT.1 <- factor(organoid.integrated$celltypes.CT.1, 
+                                             levels = rev(levels(organoid.integrated$celltypes.CT.1)))
+
+pdf(paste0(figdir.figure, '/Combined_MarkerDotPlot_BarPolt_clustersbypA_pAvsnonpAvsreference_celltypesCT1.pdf'), useDingbats = FALSE, width = 18, height = 4)
+p13 <- p11 + scale_y_discrete(position = "right") + theme(axis.text.y = element_blank())
+p14 <- plot_grid(p13, p12, align = "h", rel_widths = c(1, 1)) + theme(text = element_text(size = 40))
+plot(p14)
+dev.off()
+
+# Find mean +/- SEM of number of genes and UMIs in dataset
+mean(organoid.integrated$nCount_RNA)
+sd(organoid.integrated$nCount_RNA)/sqrt(length(organoid.integrated$nCount_RNA))
+mean(organoid.integrated$nFeature_RNA)
+sd(organoid.integrated$nFeature_RNA)/sqrt(length(organoid.integrated$nFeature_RNA))
+```
+
+```{r Find markers distinguishing photoactivated stem cells from non-photoactivated stem cells}
+figdir.figure <- "3_Figures"
+organoid.integrated <- readRDS('2_Clustering/Spacecat_IlealOrganoid_Integrated_Filtered_withaddtlBenSamples_regress_cellcycle_pctmt_nUMI_nFeat.rds')
+# Find markers distinguishing photoactivated from non-photoactivated stem cells
+Idents(organoid.integrated) <- "orig.ident"
+pA.stem.vec <- rep("no", length(colnames(organoid.integrated)))
+names(pA.stem.vec) = colnames(organoid.integrated)
+pA.stem.vec[colnames(organoid.integrated)[organoid.integrated$orig.ident == "Green" & organoid.integrated$celltypes.CT.1 == "Stem.1"]] = "pA.Stem.1"
+pA.stem.vec[colnames(organoid.integrated)[organoid.integrated$orig.ident == "Rest" & organoid.integrated$celltypes.CT.1 == "Stem.1"]] = "Rest.Stem.1"
+organoid.integrated$pA.stem = pA.stem.vec
+Idents(organoid.integrated) <- "pA.stem"
+pA.stem.markers <- FindMarkers(organoid.integrated, test.use = "wilcox", ident.1 = 'pA.Stem.1', ident.2 = 'Rest.Stem.1', assay = "RNA", slot = "data")
+
+pA.stem.markers.filtered <- pA.stem.markers %>% filter(p_val_adj < 0.05) %>% rownames_to_column(var = "gene.name")
+write.table(pA.stem.markers.filtered, file="Supplementary Table X.txt", quote=FALSE, sep="\t")
+
+# Do some Wilcoxon and effect size tests on quality-associated metrics
+mito.wilcox.test <- wilcox.test(x = organoid.integrated$percent.mt[organoid.integrated$orig.ident == "Green" & organoid.integrated$celltypes.CT.1 == "Stem.1"], 
+                         y = organoid.integrated$percent.mt[organoid.integrated$orig.ident == "Rest" & organoid.integrated$celltypes.CT.1 == "Stem.1"], 
+                         alternative = "greater")
+mito.cohensD <- cohensD(x = organoid.integrated$percent.mt[organoid.integrated$orig.ident == "Green" & organoid.integrated$celltypes.CT.1 == "Stem.1"], 
+                         y = organoid.integrated$percent.mt[organoid.integrated$orig.ident == "Rest" & organoid.integrated$celltypes.CT.1 == "Stem.1"])
+malat1.cohensD <- cohensD(
+  x = organoid.integrated@assays$RNA@data["MALAT1",][organoid.integrated$orig.ident == "Green" & organoid.integrated$celltypes.CT.1 == "Stem.1"], 
+  y = organoid.integrated@assays$RNA@data["MALAT1",][organoid.integrated$orig.ident == "Rest" & organoid.integrated$celltypes.CT.1 == "Stem.1"])
+neat1.cohensD <- cohensD(
+  x = organoid.integrated@assays$RNA@data["NEAT1",][organoid.integrated$orig.ident == "Green" & organoid.integrated$celltypes.CT.1 == "Stem.1"], 
+  y = organoid.integrated@assays$RNA@data["NEAT1",][organoid.integrated$orig.ident == "Rest" & organoid.integrated$celltypes.CT.1 == "Stem.1"])
+
+pA.stem.markers.filter <- pA.stem.markers %>% filter(p_val_adj < 0.05) %>% arrange(-avg_log2FC) %>% mutate(cohensD.val = 0)
+
+for(ii in 1:nrow(pA.stem.markers.filter)){
+  gene.ii <- rownames(pA.stem.markers.filter)[[ii]]
+  cohensD.ii <- cohensD(
+    x = organoid.integrated@assays$RNA@data[gene.ii,][organoid.integrated$orig.ident == "Green" & organoid.integrated$celltypes.CT.1 == "Stem.1"], 
+    y = organoid.integrated@assays$RNA@data[gene.ii,][organoid.integrated$orig.ident == "Rest" & organoid.integrated$celltypes.CT.1 == "Stem.1"])
+  pA.stem.markers.filter[gene.ii, "cohensD.val"] = cohensD.ii
+}
+
+# Wrapper function to pull gene lists from msigdbr
+GO.MF.genesets <- geneset.loader(gsea.category.in = "C5", gsea.subcategory.in = "GO:MF", species.in = "Homo sapiens", 
+                                    oneoff.folder.path.in = NULL, substring.list.to.filter = NULL)
+GO.HPO.genesets <- geneset.loader(gsea.category.in = "C5", gsea.subcategory.in = "HPO", species.in = "Homo sapiens", 
+                                    oneoff.folder.path.in = NULL, substring.list.to.filter = NULL)
+HALLMARK.genesets <- geneset.loader(gsea.category.in = "H", gsea.subcategory.in = NA, species.in = "Homo sapiens", 
+                                    oneoff.folder.path.in = NULL, substring.list.to.filter = NULL)
+# Wrapper function to run GSEA through fgsea
+pA.vs.ctrl.stem1.GO.MF <- GSEA.function(DEG.list.in = pA.stem.markers.filter, DEG.format.in = "constantine", 
+                                              lists.to.test = GO.MF.genesets, pval.adj.sig.thresh = 1E-2)
+pA.vs.ctrl.stem1.GO.HPO <- GSEA.function(DEG.list.in = pA.stem.markers.filter, DEG.format.in = "constantine", 
+                                              lists.to.test = GO.HPO.genesets, pval.adj.sig.thresh = 1E-2)
+pA.vs.ctrl.stem1.HALLMARK <- GSEA.function(DEG.list.in = pA.stem.markers.filter, DEG.format.in = "constantine", 
+                                              lists.to.test = HALLMARK.genesets, pval.adj.sig.thresh = 1E-2)
+
+
+```
+
+```{r Export the data as Supplementary Table 1}
+organoid.integrated <- readRDS('2_Clustering/Spacecat_IlealOrganoid_Integrated_Filtered_withaddtlBenSamples_regress_cellcycle_pctmt_nUMI_nFeat.rds')
+
+data.matrix <- as.matrix(organoid.integrated@assays$RNA@counts)
+cluster.ids <- as.character(organoid.integrated$celltypes.CT.1)
+cell.cycle.phase <- as.character(organoid.integrated$Phase)
+cell.cycle.phase[cell.cycle.phase == "G1"] <- "G0/1"
+array.of.origin <- as.character(organoid.integrated$orig.sample)
+array.of.origin[array.of.origin == "Green"] <- "Calcein.NVOC.pA"
+array.of.origin[array.of.origin == "Rest"] <- "Whole.Organoid"
+array.of.origin[array.of.origin == "Ileal1"] <- "Ref.Dataset.1"
+array.of.origin[array.of.origin == "Ileal2"] <- "Ref.Dataset.2"
+
+export.table <- rbind(array.of.origin, cluster.ids, cell.cycle.phase, data.matrix)
+
+# head(export.table)
+getwd()
+write.table(export.table, file="Supplementary Table 1.txt", quote=FALSE, sep="\t")
+```
+
+```{r Make a bar plot for tumor viability}
+tumor.rownames <- c("pA+NVOC.Hi", "pA+NVOC.Lo", "No.pA", "No.NVOC")
+tumor.viability.df <- data.frame(tumor.1 = c(86.97, 94.6, 89.36, 95.15), tumor.2 = c(95.78, 87.77, 86.13, NA), row.names = tumor.rownames)
+tumor.viability.df$viability.avg <- base::rowMeans(tumor.viability.df[,c("tumor.1", "tumor.2")], na.rm = TRUE)
+tumor.viability.df$viability.sd <- apply(tumor.viability.df[,c("tumor.1", "tumor.2")], 1, sd)
+tumor.viability.df <- tumor.viability.df %>% rownames_to_column("condition")
+tumor.viability.df$condition <- factor(tumor.viability.df$condition, levels = rev(c("No.NVOC", "No.pA", "pA+NVOC.Lo", "pA+NVOC.Hi")))
+
+p.tumor <- ggplot(tumor.viability.df) + 
+  geom_bar(aes(x = condition, y = viability.avg), stat = "identity", color = "black", fill = "black", width = 0.4) + 
+  geom_errorbar(aes(x = condition, ymin = viability.avg - viability.sd, ymax = viability.avg + viability.sd), width = 0.4, size = 0.8) + 
+  theme_classic() + theme(text = element_text(size = 16)) +
+  scale_y_continuous(expand = c(0,0), position = "right", limits = c(0,100)) + ylab("% Viable") +
+  scale_x_discrete(labels = rev(c("No NVOC", "Cells Passing\nFSC/SSC Gating", "Calcein\nNVOC- Cells", "Calcein\nNVOC+ Cells"))) + 
+  xlab("") + 
+  coord_flip()
+
+tumor.viability.df <- data.frame(tumor.1 = c(86.97, 94.6, 89.36, 95.15), tumor.2 = c(95.78, 87.77, 86.13, NA), row.names = tumor.rownames) %>% rownames_to_column(var = "condition") %>% pivot_longer(cols = !condition)
+tumor.viability.df$condition <- factor(tumor.viability.df$condition, levels = rev(c("No.NVOC", "No.pA", "pA+NVOC.Lo", "pA+NVOC.Hi")))
+p.tumor <- ggplot(tumor.viability.df) + 
+  geom_point(aes(x = condition, y = value)) + 
+  theme_classic() + theme(text = element_text(size = 16)) +
+  scale_y_continuous(expand = c(0,0), position = "right", limits = c(0,100)) + ylab("% Viable") +
+  scale_x_discrete(labels = rev(c("No NVOC", "Cells Passing\nFSC/SSC Gating", "Calcein\nNVOC- Cells", "Calcein\nNVOC+ Cells"))) + 
+  xlab("") + 
+  coord_flip()
+
+plot(p.tumor)
+pdf(paste0(figdir.figure, "/Tumor_Viability_Chart_IndivDataPts_Updated_210701.pdf"), height = 5, width = 8.5)
+plot(p.tumor)
+dev.off()
+```
+
+```{r Test for differences in cell cycle stage and cluster membership via chi-squared test}
+organoid.integrated <- readRDS('2_Clustering/Spacecat_IlealOrganoid_Integrated_Filtered_withaddtlBenSamples_regress_cellcycle_pctmt_nUMI_nFeat.rds')
+sample.type <- factor(organoid.integrated$old.ident, levels = c("Green", "Rest", "Ileal1", "Ileal2"), labels = c("Green", "Rest", "Reference", "Reference")) %>% as.character()
+organoid.integrated$sample.type <- sample.type
+# # Cell cycle
+# Calcein NVOC vs. non-pA control
+cycle.table.nvoc.vs.nonpA <- table(organoid.integrated$sample.type, organoid.integrated$PhaseRename)[c("Green", "Rest"),]
+# Calcein NVOC vs. reference dataset
+cycle.table.nvoc.vs.ref <- table(organoid.integrated$sample.type, organoid.integrated$PhaseRename)[c("Green", "Reference"),]
+  
+# # Cluster composition
+# Calcein NVOC vs. non-pA control
+cluster.table.nvoc.vs.nonpA <- table(organoid.integrated$sample.type, organoid.integrated$celltypes.CT.1)[c("Green", "Rest"),]
+# Calcein NVOC vs. reference dataset
+cluster.table.nvoc.vs.ref <- table(organoid.integrated$sample.type, organoid.integrated$celltypes.CT.1)[c("Green", "Reference"),]
+print("Figure 2F: Cell cycle differences between photoactivated and non-photoactivated control")
+chisq.test(cycle.table.nvoc.vs.nonpA)
+print("Figure 2F: Cell cycle differences between photoactivated and Ben's reference dataset")
+chisq.test(cycle.table.nvoc.vs.ref)
+print("Figure 2H: Cluster composition differences between photoactivated and non-photoactivated control")
+chisq.test(cluster.table.nvoc.vs.nonpA)
+print("Figure 2H: Cluster compsoition differences between photoactivated and Ben's reference dataset")
+chisq.test(cluster.table.nvoc.vs.ref)
+```
+
+```{r Make composition plots for tumor}
+if(!exists("tumor.data.matrix")){
+  tumor.data.matrix <- read.table(file = "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Supplementary/Supplementary Data/Supplementary Data 3.txt", sep = "\t")
+}
+
+min.value <- 0.0001
+tumor.data.df <- tumor.data.matrix[rownames(tumor.data.matrix) %in% c("Clusters.Names", "Tumor", "Sort"),] %>% as.matrix() %>% t() %>% data.frame() 
+tumor.data.df$array <- regmatches(rownames(tumor.data.df), regexpr("[[:digit:]][[:upper:]]", rownames(tumor.data.df)))
+tumor.summary.df <- tumor.data.df %>% group_by(array, Clusters.Names) %>% summarize(array.cell.count = n()) %>% mutate(array.prop = array.cell.count/sum(array.cell.count)) %>% ungroup() %>% complete(array, Clusters.Names)
+tumor.summary.df$array.prop[is.na(tumor.summary.df$array.prop)] <- min.value
+cluster.order <- c("Sox4+ Tumor", "Ccr7+ Ccl22+ DCs", "Areg+ Macrophages", "Tnfrsf9+ Macrophages", "Th2 T Cells", "Ccr2+ Macrophages", "Fibroblasts", "Cytotoxic T Cells NK Cells", "Th17 and Regulatory T Cells", "Lymphatic Endothelial Cells", "S1pr1+ T Cells", "Sftp+ Tumor", "Ccl17+ Ccr7+ DCs", "Lpl+ Chi3l3+ Macrophages", "C1q+ Macrophages", "Krt+ Tumor", "B Cells", "Arg1+ Macrophages", "Quiescent Tumor", "Monocytes or Macrophages")
+tumor.summary.df$Clusters.Names <- factor(tumor.summary.df$Clusters.Names, levels = rev(cluster.order))
+
+
+tumor1.summary.df <- tumor.summary.df %>% filter(array %in% c("1A", "2B", "3C", "4D"))
+tumor1.summary.df$condition <- factor(tumor1.summary.df$array, labels = c("Tumor1_Whole", "Tumor1_Whole", "Tumor1_Whole", "Tumor1_Border"))
+tumor1.summary.df$neglog10.array.prop <- log10(tumor1.summary.df$array.prop) - log10(min.value)
+p.tumor1 <- ggplot(tumor1.summary.df, aes(x = Clusters.Names, y = neglog10.array.prop, fill = condition)) +
+  ggtitle("Tumor 1") +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", aes(fill = condition)) + 
+  geom_point(position = position_dodge(width = 0.9)) + 
+  ylab("Cell Type Frequency") + theme_classic() +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 4), breaks = seq(0, 4, by = 1), labels = c("0", "0.001", "0.01", "0.1", "1")) + xlab("") + 
+  scale_x_discrete(labels = levels(tumor1.summary.df$Clusters.Names)) +
+  scale_fill_manual(values = rev(c("#888888", "#1c86ee"))) + 
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size=16), legend.position = "none", axis.title.x = element_blank()) + 
+  coord_flip()
+plot(p.tumor1)
+
+tumor2.summary.df <- tumor.summary.df %>% filter(array %in% c("5E", "6F", "7G", "9I"))
+tumor2.summary.df$condition <- factor(tumor2.summary.df$array, labels = c("Tumor2_Whole", "Tumor2_Whole", "Tumor2_Whole", "Tumor2_Border"))
+tumor2.summary.df$neglog10.array.prop <- log10(tumor2.summary.df$array.prop) - log10(min.value)
+p.tumor2 <- ggplot(tumor2.summary.df, aes(x = Clusters.Names, y = neglog10.array.prop, fill = condition)) +
+  ggtitle("Tumor 2") +
+  geom_bar(stat = "summary", fun = "mean", position = "dodge", aes(fill = condition)) + 
+  geom_point(position = position_dodge(width = 0.9)) + 
+  ylab("Cell Type Frequency") + theme_classic() +
+  scale_y_continuous(expand = c(0, 0), limits = c(0, 4), breaks = seq(0, 4, by = 1), labels = c("0", "0.001", "0.01", "0.1", "1")) + xlab("") + 
+  scale_x_discrete(labels = levels(tumor2.summary.df$Clusters.Names)) +
+  scale_fill_manual(values = rev(c("#888888", "#ee2c2c"))) + 
+  theme(plot.title = element_text(hjust = 0.5), text = element_text(size=16), legend.position = "none", axis.text.y = element_blank(), axis.title.x = element_blank()) + 
+  coord_flip()
+plot(p.tumor2)
+
+
+height.chosen = 6
+width.chosen = 8
+pdf("3_Figures/Figure4f_TumorCellTypeProportions_NoLabels.pdf", useDingbats = FALSE, height = height.chosen, width = width.chosen)
+plot_grid(p.tumor1 + theme(axis.text.y = element_blank()), p.tumor2)
+dev.off()
+pdf("3_Figures/Figure4f_Tumor1CellTypeProportions_WithLabels.pdf", useDingbats = FALSE, height = height.chosen, width = width.chosen)
+plot_grid(p.tumor1)
+dev.off()
+
+tumor.summary.export.df <- tumor.summary.df %>% select(!array.cell.count)
+tumor.summary.export.df$array <- factor(tumor.summary.export.df$array, levels = c("1A", "2B", "3C", "4D", "5E", "6F", "7G", "9I"))
+tumor.summary.export.df$Condition <- factor(tumor.summary.export.df$array, labels = c("WholeTumor.1", "WholeTumor.1", "WholeTumor.1", "HealthyTumorBorder.1", "WholeTumor.2", "WholeTumor.2", "WholeTumor.2", "HealthyTumorBorder.2"))
+tumor.summary.export.df$array.prop[tumor.summary.export.df$array.prop == 0.0001] <- 0
+write.table(tumor.summary.export.df, file = "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Supplementary/Source Data/SPACECAT_SourceData_Figure4F.txt", sep = "\t", row.names = FALSE)
+```
+
+```{r Make supplemental PDF and export tables for organoid cell cycle and cluster membership}
+# organoid.integrated <- readRDS('2_Clustering/Spacecat_IlealOrganoid_Integrated_Filtered_withaddtlBenSamples_regress_cellcycle_pctmt_nUMI_nFeat.rds')
+# dataset.orig <- organoid.integrated$orig.ident
+# dataset.orig[dataset.orig %in% c("Ileal1", "Ileal2")] = "Reference"
+# dataset.orig <- factor(dataset.orig, levels = c("Green", "Rest", "Reference"))
+# organoid.integrated$dataset.orig <- dataset.orig
+# cell.cycle.table <- table(organoid.integrated$PhaseRename, organoid.integrated$dataset.orig)
+# 
+# cluster.table <- table(organoid.integrated$celltypes.CT.1, organoid.integrated$dataset.orig)
+# 
+# write.table(cell.cycle.table, file = "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Non-Compiled Supplementary Files/Source Data/SPACECAT_SourceData_Figure2F.txt", sep = "\t", row.names = TRUE)
+# 
+# write.table(cluster.table, file = "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Non-Compiled Supplementary Files/Source Data/SPACECAT_SourceData_Figure2H.txt", sep = "\t", row.names = TRUE)
+
+supp.fig.filenames <- paste0("/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Non-Compiled Supplementary Files/Supplementary Figure/Supplementary Figure ", 1:9, ".pdf")
+supp.legend.filenames <- paste0("/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Non-Compiled Supplementary Files/Supplementary Figure/Supplementary Figure ", 1:9, " Legend.pdf")
+supp.figure.filenames <- c(rbind(supp.fig.filenames, supp.legend.filenames))
+
+filenames.to.concat <- c("/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Non-Compiled Supplementary Files/SI Cover Sheet/SI Cover Sheet.pdf",
+                         supp.figure.filenames,
+                         "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Non-Compiled Supplementary Files/Supplementary Table/Supplementary_Table_1.pdf",
+                         "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/Non-Compiled Supplementary Files/Supplementary Note/Supplementary Note 1.pdf")
+
+output.filename <- "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/SPACECAT_Manuscript_2019/Nature_Communications_FinalSubmission/202105XX/SPACECAT Supplementary Information.pdf"
+pdf_combine(input = filenames.to.concat, output = output.filename)
+```
+
+```{r Make tables for Broad Single-Cell Portal}
+full.table <- read.table(file = "/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/Supplementary Table 1.txt", sep = "\t")
+full.table.2 <- full.table %>% rownames_to_column(var = "GENE") %>% filter(!(GENE %in% c("array.of.origin", "cluster.ids", "cell.cycle.phase")))
+write.table(full.table.2, file=paste("/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/Broad_Portal_GEX_table.txt", sep=""), quote=FALSE, sep="\t")
+write.table(colnames(full.table.2)[2:length(colnames(full.table.2))], file = "/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/Broad_Portal_GEX_table.tsv", quote=FALSE, sep="\t")
+write.table(rownames(full.table.2)[2:length(rownames(full.table.2))], file = "/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/Broad_Portal_GEX_table.tsv", quote=FALSE, sep="\t")
+
+n.cells <- ncol(full.table)
+
+metadata.df <- data.frame(NAME = character(n.cells), biosample_id = character(n.cells), donor_id = character(n.cells), species = character(n.cells), species__ontology_label = character(n.cells), disease = character(n.cells), disease__ontology_label = character(n.cells), organ = character(n.cells), organ__ontology_label = character(n.cells), library_preparation_protocol = character(n.cells), library_preparation_protocol__ontology_label = character(n.cells), sex = character(n.cells))
+
+metadata.df.2 <- data.frame(NAME = "group", biosample_id = "group", donor_id = "group", species = "group", species__ontology_label = "group", disease = "group", disease__ontology_label = "group", organ = "group", organ__ontology_label = "group", library_preparation_protocol = "group", library_preparation_protocol__ontology_label = "group", sex = "group", spacecat_cluster_ids = "group", spacecat_cell_cycle = "group")
+
+metadata.df$NAME <- colnames(full.table)
+metadata.df$biosample_id <- as.character(full.table["array.of.origin",])
+metadata.df$donor_id <- "donor1"
+metadata.df$species <- "NCBITaxon_9606"
+metadata.df$species__ontology_label <- "Homo sapiens"
+metadata.df$disease <- "PATO_0000461"
+metadata.df$disease__ontology_label <- "normal"
+metadata.df$organ <- "UBERON_0002116"
+metadata.df$organ__ontology_label <- "ileum"
+metadata.df$library_preparation_protocol <- "EFO_0008919"
+metadata.df$library_preparation_protocol__ontology_label <- "Seq-Well"
+metadata.df$sex <- "unknown"
+metadata.df$spacecat_cluster_ids <- as.character(full.table["cluster.ids",])
+metadata.df$spacecat_cell_cycle <- as.character(full.table["cell.cycle.phase",])
+
+metadata.df.3 <- rbind(metadata.df.2, metadata.df)
+
+write.table(metadata.df.3, file = "/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/Broad_Portal_metadata_table_4.tsv", quote=FALSE, sep="\t")
+
+organoid.obj <- readRDS("/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/2_Clustering/Spacecat_IlealOrganoid_Integrated_Filtered_withaddtlBenSamples_regress_cellcycle_pctmt_nUMI_nFeat.rds")
+DefaultAssay(organoid.obj) <- "RNA"
+FeaturePlot(organoid.obj, features = c("ALDH1A1", "ANPEP", "RARA", "OLFM4"), slot = "data")
+VlnPlot(organoid.obj, features = c("ALDH1A1", "ANPEP", "RARA", "OLFM4"), group.by = "celltypes.CT.1")
+rna.normalized.table <- organoid.obj@assays$RNA@data
+rna.normalized.table <- data.frame(rna.normalized.table) %>% rownames_to_column(var = "GENE")
+write.table(rna.normalized.table, file = "/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/Broad_Portal_GEX_rnanormalized_table.tsv", quote=FALSE, sep="\t", row.names = FALSE)
+
+spatial.table <- data.frame(NAME = character(n.cells), X = numeric(n.cells), Y = numeric(n.cells))
+spatial.table$NAME <- colnames(full.table)
+spatial.table$X <- organoid.obj@reductions$umap@cell.embeddings[,"UMAP_1"]
+spatial.table$Y <- organoid.obj@reductions$umap@cell.embeddings[,"UMAP_2"]
+
+spatial.table.2 <- data.frame(NAME = "TYPE", X = "numeric", Y = "numeric")
+
+spatial.table.3 <- rbind(spatial.table.2, spatial.table)
+
+write.table(spatial.table.3, file = "/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/Organoid_Analysis/Broad_Portal_spatial_table.tsv", quote=FALSE, sep="\t")
+```
+

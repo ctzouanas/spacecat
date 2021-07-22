@@ -1,0 +1,226 @@
+
+```{r}
+library(ggplot2)
+library(magrittr)
+library(dplyr)
+library(tidyr)
+library(RColorBrewer)
+```
+
+```{r Compiling dataframes of segmented images}
+
+# Read in data corresponding to a particular experimental condition
+# Iterating variables: ii refers to which spreadsheet/experimental condition we're analyzing, jj refers to the image within the experimental condition, and kk refers to the hypothetical center of the pA'd region that we're testing
+folder.path <- "/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/Experiments/200909_Extended_Timecourse_Day1and2/Segmented_Spreadsheets"
+file.paths <- list.files(folder.path)
+
+# Initialize some constants corresponding to the radius of the ROI, taken from the screencap of the photoactivation ROI. ROI was always a circle with the same radius
+measured.screencap.ROI.radius <- 584
+measured.screencap.image.size <- 1496
+real.image.size <- 2048
+ROI.radius <- measured.screencap.ROI.radius/measured.screencap.image.size/2*real.image.size
+# Parameter for how fine of a grid to search for the optimal center of the photoactivation ROI. 
+grid.size <- 100
+
+overall.df.646 <- data.frame()
+overall.df.nvoc <- data.frame()
+start = Sys.time()
+for(ii in 1:length(file.paths)){
+  file.path.ii <- paste0(folder.path, '/', file.paths[[ii]])
+  print(paste0('Starting on spreadsheet ', toString(ii), ' of ', toString(length(file.paths))))
+  data.ii <- read.table(file.path.ii, sep = ",", header = TRUE)
+  split.file.path <- strsplit(file.path.ii, "_")
+  dye.ii <- split.file.path[[1]][[7]]
+  timepoint.ii <- split.file.path[[1]][[8]]
+  pa.time.ii <- split.file.path[[1]][[9]]
+  pa.truth.ii <- split.file.path[[1]][[10]]
+  if(pa.truth.ii == "pA"){
+    # Store the number of images in the experimental condition
+    image.count <- unique(data.ii$ImageNumber)
+
+    for(jj in image.count){
+      # Make a dataframe with all points in the grid, and an extra column for storing the ratio of cells' fluorescence values inside vs. outside of the ROI
+      grid.spaces <- seq(0, real.image.size, grid.size)
+      grid.spaces <- grid.spaces + 0.5*(real.image.size - max(grid.spaces))
+      grid.squares <- expand.grid(grid.spaces, grid.spaces)
+      grid.squares$fluor.ratio <- NA
+      for(kk in 1:nrow(grid.squares)){
+        # Display something as a progress indicator
+        if(kk %% 100 == 0){
+          print(paste0(toString(kk), ' iterations of ', toString(nrow(grid.squares)), ' complete in image ', toString(jj), ' of ', length(image.count), '!'))
+        }
+        # Pull the cells (i.e., rows) corresponding to the image of interest
+        data.ii.image.jj <- data.ii[data.ii$ImageNumber == jj,]
+        # Add a column corresponding to distance from the potential ROI grid spot, a column as a logical for whether the cell is inside the ROI radius, and group according to that logical
+        data.ii.image.jj <- data.ii.image.jj %>% mutate(distance = sqrt( 
+          (grid.squares[kk,1] - Location_Center_X)^2 + (grid.squares[kk,2] - Location_Center_Y)^2 )) %>% 
+          mutate(in.ROI = distance < ROI.radius) %>% group_by(in.ROI)
+        # Find the mean cellular fluorescence intensity inside vs. outside of the ROI
+        if(dye.ii == "NVOC"){
+          data.ii.image.jj.summary <- data.ii.image.jj %>% dplyr::summarise(fluorescence = mean(Intensity_MeanIntensity_FITC, na.rm = TRUE), .groups = "keep")
+        } else if(dye.ii == "JF646"){
+          data.ii.image.jj.summary <- data.ii.image.jj %>% dplyr::summarise(fluorescence = mean(Intensity_MeanIntensity_CY5, na.rm = TRUE), .groups = "keep")
+        }
+
+        # Store that fluorescence ratio in the grid.squares data.frame
+        grid.squares$fluor.ratio[kk] <- data.ii.image.jj.summary$fluorescence[2] / data.ii.image.jj.summary$fluorescence[1]
+      }
+      # Find the grid spot with the best fluorescence ratio
+      chosen.center <- grid.squares %>% top_n(1, fluor.ratio)
+      # Label cells according to whether or not they're inside the ROI using the chosen center
+      # Pull the cells (i.e., rows) corresponding to the image of interest
+      data.ii.image.jj <- data.ii[data.ii$ImageNumber == image.count[[jj]],]
+      # Add a column corresponding to distance from the potential ROI grid spot, a column as a logical for whether the cell is inside the ROI radius, and group according to that logical
+      data.ii.image.jj <- data.ii.image.jj %>% mutate(distance = sqrt( 
+        (chosen.center$Var1 - Location_Center_X)^2 + (chosen.center$Var2 - Location_Center_Y)^2 )) %>% 
+        mutate(in.ROI = distance < ROI.radius) %>% mutate(pA.ROI.center_x = chosen.center$Var1) %>% mutate(pA.ROI.center_y = chosen.center$Var2)
+      data.ii.image.jj$dye <- dye.ii
+      data.ii.image.jj$timepoint <- timepoint.ii
+      data.ii.image.jj$pa.time <- pa.time.ii
+      data.ii.image.jj$pa.truth <- pa.truth.ii
+      if(dye.ii == "NVOC"){
+        overall.df.nvoc <- rbind(overall.df.nvoc, data.ii.image.jj)
+      } else if(dye.ii == "JF646"){
+        overall.df.646 <- rbind(overall.df.646, data.ii.image.jj)
+      }
+    }
+  } else if(pa.truth.ii == "nonpA"){
+    data.ii <- data.ii %>% mutate(distance = sqrt( (1024 - Location_Center_X)^2 + (1024 - Location_Center_Y)^2 )) %>% 
+  mutate(in.ROI = NA) %>% mutate(pA.ROI.center_x = 1024) %>% mutate(pA.ROI.center_y = 1024)
+    data.ii$dye <- dye.ii
+    data.ii$timepoint <- timepoint.ii
+    data.ii$pa.time <- pa.time.ii
+    data.ii$pa.truth <- pa.truth.ii
+    if(dye.ii == "NVOC"){
+      overall.df.nvoc <- rbind(overall.df.nvoc, data.ii)
+    } else if(dye.ii == "JF646"){
+      overall.df.646 <- rbind(overall.df.646, data.ii)
+    }
+  }
+}
+
+# Split out cells according to whether they're inside or outside of the ROI
+# ggplot(data = overall.df, aes(x = Intensity_MeanIntensity_FITC, group = in.ROI, fill = in.ROI)) + geom_density(adjust = 1.5, alpha = 0.4) + theme_classic()
+# ggplot(data = overall.df, aes(x = distance, y = Intensity_MeanIntensity_FITC, group = in.ROI, color = in.ROI)) + 
+#   geom_density_2d(binwidth = 0.03) + theme_classic()
+# plot(p1)
+# plot(p2)
+finish = Sys.time()
+print(finish - start)
+
+saveRDS(overall.df.nvoc, '/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/Experiments/200909_Extended_Timecourse_Day1and2/Segmented_Spreadsheets/NVOC_Segmented_Cells.rds')
+saveRDS(overall.df.646, '/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/Experiments/200909_Extended_Timecourse_Day1and2/Segmented_Spreadsheets/JF646_Segmented_Cells.rds')
+```
+
+```{r Make graphs based on segmented images}
+# What graphs do I want to make?
+# 0 hour post-pA: pA'd wells in ROI vs. nonpA'd wells everywhere
+# 16 hour post-pA: pA'd wells in ROI vs. nonpA'd wells everywhere
+# Let's start with the 16 hour timepoint - pull out cells from 16 hour timepoint pA'd wells in the ROI
+overall.df.nvoc <- readRDS('/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/Experiments/200909_Extended_Timecourse_Day1and2/NVOC_Segmented_Cells.rds')
+timepoint.of.int <- "16hour"
+n.hours <- gsub("([0-9]+).*$", "\\1", timepoint.of.int)
+pa.time.of.int <- "postpA"
+
+pa.truth.of.int <- "pA"
+pA.wells.df <- overall.df.nvoc %>% dplyr::filter(timepoint == timepoint.of.int & pa.time == pa.time.of.int & pa.truth == "pA" & in.ROI == TRUE)
+nonpA.wells.df <- overall.df.nvoc %>% dplyr::filter(timepoint == timepoint.of.int & pa.time == pa.time.of.int & pa.truth == "nonpA")
+timepoint.df <- rbind(pA.wells.df, nonpA.wells.df)
+timepoint.df <- timepoint.df %>% arrange(pa.truth)
+
+ggplot(data = timepoint.df, aes(x = Intensity_MeanIntensity_FITC, group = pa.truth, fill = pa.truth)) + 
+  geom_density(alpha = 0.5, bw = 0.004) + 
+  theme_classic() + 
+  scale_x_continuous(expand = c(0,0), name = 'Fluorescence Intensity (A.U.)') + 
+  scale_y_continuous(expand = c(0,0), name = 'Probability Density (A.U.)') + 
+  coord_cartesian(ylim=c(0, NA)) + 
+  ggtitle(paste0(unique(timepoint.df$dye), " Fluorescence ", n.hours, " Hours After Photoactivation")) + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = c(0.85, 0.5)) + 
+  scale_fill_manual(values=c("#aaaaaa", "#009900"), name = "Photoactivated Status", labels = c("Nonphotoactivated\nAdjacent Well", "Photoactivated"))
+
+ggsave(paste0('/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/Experiments/200909_Extended_Timecourse_Day1and2/Figures/', unique(timepoint.df$dye), '_', timepoint.of.int, '_', pa.time.of.int, '_200909_extended_timecourse_distribution.pdf'), width = 7, height = 4)
+
+ggplot(data = timepoint.df, aes(x = distance, y = Intensity_MeanIntensity_FITC, group = pa.truth, color = pa.truth)) +
+  geom_point(alpha = 0.2) + theme_classic() +
+  scale_x_continuous(expand = c(0,0), name = "Distance from Center of Photoactivated Region (pixels)") +
+  scale_y_continuous(expand = c(0,0), name = "Fluorescence Intensity (A.U.)") +
+  ggtitle(paste0(unique(timepoint.df$dye), " Fluorescence ", n.hours, " Hours After Photoactivation")) + 
+  theme(plot.title = element_text(hjust = 0.5), legend.position = c(0.85, 0.5)) +
+  scale_color_manual(values=c("#aaaaaa", "#009900"), name = "Photoactivated Status", labels = c("Nonphotoactivated\nAdjacent Well", "Photoactivated"))
+
+p.val.timepoint <- wilcox.test(x = timepoint.df$Intensity_MeanIntensity_FITC[timepoint.df$pa.truth == "pA"],
+                               y = timepoint.df$Intensity_MeanIntensity_FITC[timepoint.df$pa.truth == "nonpA"])
+
+# ggsave(paste0('/Users/ctzouanas/Dropbox (MIT)/Shalek Lab/Projects/SpaceCat/Experiments/200909_Extended_Timecourse_Day1and2/Figures/', unique(timepoint.df$dye), '_', timepoint.of.int, '_', pa.time.of.int, '_200909_extended_timecourse_intensity_vs_distance.pdf'), width = 7, height = 4)
+
+# ggplot() +
+#   geom_density_2d(data = pA.wells.df, aes(x = distance, y = Intensity_MeanIntensity_FITC), h = c(150,0.06), color = "#009900") + 
+#   geom_point(data = pA.wells.df, aes(x = distance, y = Intensity_MeanIntensity_FITC), color = "#009900") + 
+#   geom_point(data = nonpA.wells.df, aes(x = distance, y = Intensity_MeanIntensity_FITC), color = "#aaaaaa") + 
+#   geom_density_2d(data = nonpA.wells.df, aes(x = distance, y = Intensity_MeanIntensity_FITC), h = c(150,0.08), color = "#aaaaaa") + 
+#   theme_classic() +
+#   scale_x_continuous(expand = c(0,0), name = "Distance from Center of Photoactivated Region (pixels)", limits = c(0, NA)) +
+#   scale_y_continuous(expand = c(0,0), name = "Fluorescence Intensity (A.U.)", limits = c(0, NA)) +
+#   theme(plot.title = element_text(hjust = 0.5), legend.position = c(0.85, 0.5))
+
+```
+
+```{r}
+um.per.pixel <- 333/2048
+folder.path <- '/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/190720 - Full Timecourse Segmentation/'
+file.list.new.format <- list.files(folder.path)
+dFF0.all.cells <- data.frame()
+for(ii in 1:length(file.list.new.format)){
+  file.path.ii <- file.list.new.format[[ii]]
+  position.and.number.ii <- regmatches(file.path.ii, regexpr("Position[0-9]{1,}", file.path.ii))
+  only.pos.number.ii <- regmatches(position.and.number.ii, regexpr("[0-9]{1,}", position.and.number.ii))
+  if(only.pos.number.ii %in% c("7", "10")){
+    data.position.ii <- read.table(paste0(folder.path, file.path.ii), header = TRUE, sep = "\t")
+    data.position.filtered.ii <- data.position.ii %>% dplyr::select(ImageNumber, ObjectNumber, Intensity_MeanIntensity_FITC, Location_Center_X, Location_Center_Y) %>% dplyr::mutate(distance = sqrt((1024-Location_Center_X)^2 + (1024-Location_Center_Y)^2)) %>% dplyr::select(-Location_Center_X, -Location_Center_Y)
+    data.position.by.cell.ii <- data.position.filtered.ii %>% tidyr::pivot_wider(names_from = c(ImageNumber), values_from = c(Intensity_MeanIntensity_FITC, distance)) %>% dplyr::select(-num_range("distance_", 2:6), -ObjectNumber)
+    data.position.by.cell.ii[,1:6] <- (data.position.by.cell.ii[,1:6] - rep(as.numeric(data.position.by.cell.ii$Intensity_MeanIntensity_FITC_1),6)) / rep(as.numeric(data.position.by.cell.ii$Intensity_MeanIntensity_FITC_1),6)
+    data.position.by.cell.ii <- data.position.by.cell.ii %>% dplyr::filter(distance_1 < 192)
+    colnames(data.position.by.cell.ii) <- c("dFF0_0min", "dFF0_0plus", "dFF0_10", "dFF0_60", "dFF0_120", "dFF0_180", "Distance.pixel")
+    data.position.by.cell.ii$Position <- only.pos.number.ii
+    dFF0.all.cells <- rbind(dFF0.all.cells, data.position.by.cell.ii)
+  } else if(only.pos.number.ii %in% c("1", "2", "3", "4", "5", "6", "8", "9")){
+    data.position.ii <- read.table(paste0(folder.path, file.path.ii), header = TRUE, sep = ",")
+    data.position.filtered.ii <- data.position.ii %>% dplyr::select(ImageNumber, ObjectNumber, Intensity_MeanIntensity_FITC0minus, Intensity_MeanIntensity_FITC0plus, Intensity_MeanIntensity_FITC10, Intensity_MeanIntensity_FITC60, Intensity_MeanIntensity_FITC120, Intensity_MeanIntensity_FITC180, Location_Center_X, Location_Center_Y) %>% dplyr::mutate(distance = sqrt((1024-Location_Center_X)^2 + (1024-Location_Center_Y)^2)) %>% dplyr::select(-Location_Center_X, -Location_Center_Y)
+    data.position.by.cell.ii <- data.position.filtered.ii %>% dplyr::select(-c(ImageNumber, ObjectNumber))
+    F0.matrix <- matrix(rep(as.matrix(data.position.by.cell.ii$Intensity_MeanIntensity_FITC0minus), 6) , ncol = 6)
+    data.position.by.cell.ii[,1:6] <- (data.position.by.cell.ii[,1:6] - F0.matrix) / F0.matrix
+    data.position.by.cell.ii <- data.position.by.cell.ii %>% dplyr::filter(distance < 192)
+    colnames(data.position.by.cell.ii) <- c("dFF0_0min", "dFF0_0plus", "dFF0_10", "dFF0_60", "dFF0_120", "dFF0_180", "Distance.pixel")
+    data.position.by.cell.ii$Position <- only.pos.number.ii
+    dFF0.all.cells <- rbind(dFF0.all.cells, data.position.by.cell.ii)
+  }
+}
+
+protocols <- as.character(c(1, 1, 2, 2, 3, 3, 4, 4, 5, 5))
+names(protocols) <- as.character(c(9, 2, 1, 3, 8, 4, 5, 6, 10, 7))
+
+std <- function(x) sd(x)/sqrt(length(x))
+
+dFF0.all.cells$Protocol <- protocols[dFF0.all.cells$Position]
+dFF0.all.cells <- dplyr::select(dFF0.all.cells, -Position)
+dFF0.mean.summary.df <- aggregate(dFF0.all.cells[,1:6], list(dFF0.all.cells$Protocol), mean)
+dFF0.mean.summary.df$measure <- "mean"
+dFF0.mean.summary.df <- dFF0.mean.summary.df %>% pivot_longer(-c(Group.1, measure), names_to = "Time", values_to = "dFF0.mean") %>% dplyr::select(-measure)
+dFF0.std.summary.df <- aggregate(dFF0.all.cells[,1:6], list(dFF0.all.cells$Protocol), std)
+dFF0.std.summary.df$measure <- "std"
+dFF0.std.summary.df <- dFF0.std.summary.df %>% pivot_longer(-c(Group.1, measure), names_to = "Time", values_to = "dFF0.std") %>% dplyr::select(-measure)
+dFF0.summary.df <- left_join(dFF0.mean.summary.df, dFF0.std.summary.df, by = c("Group.1", "Time"))
+
+times <- c(0, 2, 10, 60, 120, 180)
+names(times) <- unique(dFF0.summary.df$Time)
+dFF0.summary.df$minutes <- times[dFF0.summary.df$Time]
+
+colors <- brewer.pal(n = 8, name = "Greens")
+colors <- colors[4:8]
+ggplot(dFF0.summary.df, aes(x = minutes, y = dFF0.mean, group = Group.1, colour = Group.1)) + geom_errorbar(aes(ymin = dFF0.mean - dFF0.std, ymax = dFF0.mean + dFF0.std)) + geom_line() + geom_point() + theme_classic() + scale_x_continuous(name = "Time (min.)", breaks = c(0, 10, 60, 120, 180), expand = c(0,0), limits = c(0, 181)) + scale_y_continuous(name = expression("\u0394F/F"[0]), breaks = c(0, 2.5, 5), expand = c(0,0)) + scale_colour_discrete(name = "Total Photoactivation\nTime at 40X Mag. (sec.)", labels = c(0.5, 1.25, 2.5, 4, 5), type = colors) + theme(text = element_text(size=16), legend.title = element_text(size = 14))
+ggsave(filename = '/Users/ctzouanas/Documents/MIT/Shalek/Spacecat/190720 - Full Timecourse Segmentation/180723_Timecourse_by_Cells_Over_Time.pdf', width = 7, height = 4)
+
+table(dFF0.all.cells$Protocol)
+
+```
+
